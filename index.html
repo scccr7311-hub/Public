@@ -79,6 +79,10 @@
       }
       transcriptEl.textContent = finalText + interim
     }
+    rec.onerror = (e) => {
+      const msg = { 'not-allowed': '마이크 권한이 막혀 있어요', 'network': '네트워크가 필요해요 (구글 서버 연결)', 'no-speech': '소리가 안 들려요', 'audio-capture': '마이크를 못 찾았어요' }[e.error] || ('자막 오류: ' + e.error)
+      transcriptEl.textContent = '⚠️ ' + msg
+    }
     rec.onend = () => {
       if (mr && mr.state === 'recording') {
         try { rec.start() } catch {}
@@ -191,7 +195,10 @@
       recBtn.classList.remove('on')
       return
     }
-    let stream = warmStream
+    function streamAlive(s) {
+      return s && s.active && s.getAudioTracks().some((t) => t.readyState === 'live')
+    }
+    let stream = streamAlive(warmStream) ? warmStream : null
     if (!stream) {
       try {
         stream = await openMic()
