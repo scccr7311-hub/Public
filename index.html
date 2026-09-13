@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>음성메모 1번</title>
+<link rel="manifest" href="./manifest.webmanifest">
+<meta name="theme-color" content="#ff5a3c">
+<link rel="icon" type="image/png" href="./icon-192.png">
+<link rel="apple-touch-icon" href="./icon-192.png">
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px }
+  button { font-size: 18px; padding: 12px 20px; border-radius: 12px; border: none; cursor: pointer }
+  #rec { background: #ff5a3c; color: #fff }
+  #rec.on { background: #333 }
+  #save { background: #1f7a3d; color: #fff }
+  input { font-size: 16px; padding: 10px; width: 100%; box-sizing: border-box; margin: 12px 0 }
+  audio { width: 100%; margin-top: 12px }
+  .hint { color: #666; font-size: 13px }
+</style>
+</head>
+<body>
+<h2>🎙️ 음성메모 1번</h2>
+<input id="title" placeholder="제목 (비우면 날짜만, 예: 슬롯파티 돈비 수정)">
+<div>
+  <button id="rec" type="button">● 녹음 시작</button>
+  <button id="save" type="button" disabled>💾 저장</button>
+</div>
+<div style="background:#eee; border-radius:8px; height:14px; margin-top:10px; overflow:hidden">
+  <div id="level" style="background:linear-gradient(90deg,#1f7a3d,#ffd54a,#ff5a3c); height:100%; width:0%"></div>
+</div>
+<audio id="player" controls hidden></audio>
+<h3>📝 실시간 자막 (크롬 무료)</h3>
+<div id="transcript" style="border:1px solid #ccc; border-radius:8px; padding:10px; min-height:80px; font-size:15px; white-space:pre-wrap;"></div>
+<div style="margin-top:8px">
+  <button id="copyBtn" type="button">📋 자막 복사</button>
+  <button id="txtBtn" type="button" disabled>💾 텍스트 저장</button>
+</div>
+<p id="status"></p>
+<p><a id="openLink" href="#" hidden>저장이 안 되면 이 링크로 열기 (열린 뒤 공유 버튼으로 저장)</a></p>
+<p class="hint">저장하면 <b>날짜_제목.webm</b>으로 내려받아져요. 10초 안에 <b>문서/voice-memo/sorted/audio</b>로 자동 정리돼요. 서버 0원, 전부 이 맥 안에서 돌아가요.<br>페이지 열 때 마이크가 켜져서 버튼 누르면 즉시 녹음돼요. 탭을 닫으면 마이크가 꺼져요.</p>
+<script>
+  const recBtn = document.getElementById('rec')
+  const saveBtn = document.getElementById('save')
+  const player = document.getElementById('player')
+  const titleInput = document.getElementById('title')
+  let mr = null
+  let chunks = []
+  let blobUrl = ''
+  let warmStream = null
+  let tickTimer = null
+  let rec = null
+  let finalText = ''
+  const transcriptEl = document.getElementById('transcript')
+  const copyBtn = document.getElementById('copyBtn')
+  const txtBtn = document.getElementById('txtBtn')
+
+  function recogOK() {
+    return window.SpeechRecognition || window.webkitSpeechRecognition
+  }
+
+  function startCaptions() {
+    if (!recogOK()) {
+      transcriptEl.textContent = '이 브라우저는 실시간 자막을 지원 안 해요 (크롬 권장)'
+      return
+    }
+    const C = window.SpeechRecognition || window.webkitSpeechRecognition
+    rec = new C()
+    rec.lang = 'ko-KR'
+    rec.continuous = true
+    rec.interimResults = true
+    let interim = ''
+    rec.onresult = (e) => {
+      interim = ''
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript
+        if (e.results[i].isFinal) finalText += t + ' '
+        else interim += t
+      }
+      transcriptEl.textContent = finalText + interim
+    }
+    rec.onend = () => {
+      if (mr && mr.state === 'recording') {
+        try { rec.start() } catch {}
+      }
+    }
+    finalText = ''
+    transcriptEl.textContent = ''
+    try { rec.start() } catch {}
+  }
+
+  const levelEl = document.getElementById('level')
+  let levelCtx = null
+  let levelRaf = null
+
+  function startLevel(stream) {
+    try {
+      levelCtx = levelCtx || new (window.AudioContext || window.webkitAudioContext)()
+      if (levelCtx.state === 'suspended') levelCtx.resume()
+      const src = levelCtx.createMediaStreamSource(stream)
+      const an = levelCtx.createAnalyser()
+      an.fftSize = 256
+      src.connect(an)
+      const buf = new Uint8Array(an.frequencyBinCount)
+      const draw = () => {
+        an.getByteTimeDomainData(buf)
+        let peak = 0
+        for (let i = 0; i < buf.length; i++) {
+          const v = Math.abs(buf[i] - 128) / 128
+          if (v > peak) peak = v
+        }
+        levelEl.style.width = Math.min(100, Math.round(peak * 160)) + '%'
+        levelRaf = requestAnimationFrame(draw)
+      }
+      draw()
+    } catch {}
+  }
+
+  function stopLevel() {
+    if (levelRaf) cancelAnimationFrame(levelRaf)
+    levelRaf = null
+    levelEl.style.width = '0%'
+  }
+
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+    navigator.serviceWorker.register('./sw.js').catch(() => {})
+  }
+
+  function stopCaptions() {
+    if (rec) {
+      rec.onend = null
+      try { rec.stop() } catch {}
+      rec = null
+    }
+    txtBtn.disabled = !finalText.trim()
+  }
+
+  copyBtn.addEventListener('click', async () => {
+    const t = transcriptEl.textContent.trim()
+    if (!t) return
+    try {
+      await navigator.clipboard.writeText(t)
+      copyBtn.textContent = '✅ 복사됨'
+      setTimeout(() => { copyBtn.textContent = '📋 자막 복사' }, 1500)
+    } catch {
+      const r = document.createRange()
+      r.selectNodeContents(transcriptEl)
+      const s = getSelection()
+      s.removeAllRanges()
+      s.addRange(r)
+      document.execCommand('copy')
+    }
+  })
+
+  txtBtn.addEventListener('click', () => {
+    const t = finalText.trim()
+    if (!t) return
+    const title = titleInput.value.trim().replace(/[\\/:"*?<>|]/g, '').slice(0, 40)
+    const name = stamp() + (title ? '_' + title : '') + '.txt'
+    const blob = new Blob([t], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    status.textContent = '텍스트 저장됨: ' + name + ' (docs로 자동 분류돼요)'
+  })
+
+  async function openMic() {
+    try {
+      warmStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      })
+      return warmStream
+    } catch (e) {
+      alert('마이크 권한이 필요해요: ' + e.message)
+      throw e
+    }
+  }
+
+  openMic().catch(() => {})
+
+  recBtn.addEventListener('click', async () => {
+    if (mr && mr.state === 'recording') {
+      mr.stop()
+      stopCaptions()
+      stopLevel()
+      recBtn.textContent = '● 녹음 시작'
+      recBtn.classList.remove('on')
+      return
+    }
+    let stream = warmStream
+    if (!stream) {
+      try {
+        stream = await openMic()
+      } catch {
+        return
+      }
+    }
+    chunks = []
+      mr = AUDIO_MIME ? new MediaRecorder(stream, { mimeType: AUDIO_MIME }) : new MediaRecorder(stream)
+    mr.ondataavailable = (e) => {
+      if (e.data && e.data.size) chunks.push(e.data)
+    }
+    mr.onstop = () => {
+      clearInterval(tickTimer)
+      const blob = new Blob(chunks, { type: mr.mimeType || 'audio/webm' })
+      blobUrl = URL.createObjectURL(blob)
+      player.src = blobUrl
+      player.hidden = false
+      saveBtn.disabled = false
+    }
+    mr.onerror = (e) => {
+      alert('녹음 오류: ' + (e.error ? e.error.name : '알 수 없음'))
+    }
+    mr.start(1000)
+    startCaptions()
+    startLevel(stream)
+    const t0 = Date.now()
+    tickTimer = setInterval(() => {
+      const s = Math.floor((Date.now() - t0) / 1000)
+      recBtn.textContent = '■ 녹음 중 ' + s + '초 (누르면 중지)'
+    }, 500)
+    recBtn.textContent = '■ 녹음 중 0초 (누르면 중지)'
+    recBtn.classList.add('on')
+    saveBtn.disabled = true
+    player.hidden = true
+  })
+
+  function stamp() {
+    const d = new Date()
+    const p = (n) => String(n).padStart(2, '0')
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes())
+  }
+
+  const status = document.getElementById('status')
+  const openLink = document.getElementById('openLink')
+
+  function pickMime() {
+    const cands = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']
+    for (const c of cands) {
+      try {
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported(c)) return c
+      } catch {}
+    }
+    return ''
+  }
+  const AUDIO_MIME = pickMime()
+  const AUDIO_EXT = AUDIO_MIME === 'audio/mp4' ? 'm4a' : 'webm'
+
+  saveBtn.addEventListener('click', async () => {
+    if (!blobUrl) {
+      status.textContent = '먼저 녹음을 하고 중지까지 누르세요.'
+      return
+    }
+    const title = titleInput.value.trim().replace(/[\\/:"*?<>|]/g, '').slice(0, 40)
+    const name = stamp() + (title ? '_' + title : '') + '.' + AUDIO_EXT
+    const a = document.createElement('a')
+    a.href = blobUrl
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    openLink.href = blobUrl
+    openLink.target = '_blank'
+    openLink.hidden = false
+    status.textContent = '저장 시작됨: ' + name + ' (브라우저 다운로드 폴더를 확인하세요)'
+  })
+</script>
+</body>
+</html>
